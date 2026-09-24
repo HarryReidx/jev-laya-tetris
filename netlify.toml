@@ -1,0 +1,31 @@
+[build]
+  publish = "."
+
+[[redirects]]
+  from = "/decide"
+  to = "http://172.24.0.5:8089/decide"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/commentary"
+  to = "http://172.24.0.5:8089/commentary"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/health"
+  to = "http://172.24.0.5:8089/health"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/api/*"
+  to = "http://172.24.0.5:8089/api/:splat"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

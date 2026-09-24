@@ -1,0 +1,15 @@
+node_modules/
+.env
+.env.*
+!.env.example
+.DS_Store
+*.log
+.venv-laya/
+__pycache__/
+.run/
+netlify-dist/
+bundle-update.tar.gz
+*.tar.gz
+deploy_remote.py
+test_gemini.py
+docs/temp_video/

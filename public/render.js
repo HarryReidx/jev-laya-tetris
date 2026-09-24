@@ -1,0 +1,585 @@
+// Canvas drawing for one player's field: board, ghost, falling piece, hold,
+// next queue, incoming-garbage meter and short-lived effects.
+//
+// Everything here only READS game state. Effects are driven by the events the
+// engine emits (lock, clear, spin, garbage...), so the renderer never has to
+// guess what happened between frames.
+
+import { CELLS, COLS, ROWS, BUFFER, cellsAt } from '/engine/pieces.js'
+
+export const CELL = 28
+const VIS = ROWS - BUFFER
+export const FIELD_W = COLS * CELL
+export const FIELD_H = VIS * CELL
+const SIDE = 4.2 * CELL // hold / next column width
+const METER = 10 // garbage meter width
+const GAP = 10
+
+// Two rows of headroom above the field, where pieces spawn, so a new piece is
+// seen whole rather than poking in from off-screen.
+const HEAD = 2 * CELL
+
+export const CANVAS_W = SIDE + GAP + METER + 4 + FIELD_W + GAP + SIDE
+export const CANVAS_H = HEAD + FIELD_H + 2 // + a hair for the border
+
+// Callouts (DOUBLE, B2B...) sit at the bottom of the hold column; the decision
+// log (an HTML overlay, see app.js) fills the space between them and the hold box.
+const CALLOUT_H = 150
+// In canvas pixels: the panel is drawn translated down by HEAD (see drawPlayer).
+export const LOG_BOX = { x: 0, y: HEAD + 22 + SIDE * 0.72 + 14, w: SIDE + GAP, h: 0 }
+LOG_BOX.h = HEAD + FIELD_H - CALLOUT_H - LOG_BOX.y - 10
+
+export const COLOR = {
+  I: '#3fd0e6', O: '#f2d24b', T: '#b26cf0',
+  S: '#63d65f', Z: '#f0606d', J: '#5b7ff0', L: '#f29d4a',
+  G: '#6d7480', // garbage
+}
+
+/** Size a canvas for the device pixel ratio and return a 1:1 context. */
+/** `scale` enlarges the board on screen; drawing code keeps its CELL-based units. */
+export function setupCanvas(canvas, w, h, scale = 1) {
+  const dpr = window.devicePixelRatio || 1
+  canvas.width = Math.round(w * dpr * scale)
+  canvas.height = Math.round(h * dpr * scale)
+  canvas.style.width = `${Math.round(w * scale)}px`
+  canvas.style.height = `${Math.round(h * scale)}px`
+  const ctx = canvas.getContext('2d')
+  ctx.setTransform(dpr * scale, 0, 0, dpr * scale, 0, 0)
+  return ctx
+}
+
+function block(ctx, px, py, size, color, alpha = 1) {
+  ctx.globalAlpha = alpha
+  ctx.fillStyle = color
+  ctx.fillRect(px + 1, py + 1, size - 2, size - 2)
+  // a soft top-left highlight gives the blocks a little depth
+  ctx.globalAlpha = alpha * 0.28
+  ctx.fillStyle = '#fff'
+  ctx.fillRect(px + 1, py + 1, size - 2, 3)
+  ctx.fillRect(px + 1, py + 1, 3, size - 2)
+  ctx.globalAlpha = alpha * 0.25
+  ctx.fillStyle = '#000'
+  ctx.fillRect(px + 1, py + size - 4, size - 2, 3)
+  ctx.globalAlpha = 1
+}
+
+function ghost(ctx, px, py, size, color) {
+  ctx.globalAlpha = 0.22
+  ctx.fillStyle = color
+  ctx.fillRect(px + 1, py + 1, size - 2, size - 2)
+  ctx.globalAlpha = 0.55
+  ctx.strokeStyle = color
+  ctx.lineWidth = 1.5
+  ctx.strokeRect(px + 2, py + 2, size - 4, size - 4)
+  ctx.globalAlpha = 1
+}
+
+/** Draw a piece's spawn orientation centred in a box. */
+function mini(ctx, type, x, y, w, h, alpha = 1) {
+  if (!type) return
+  const cells = CELLS[type][0]
+  const xs = cells.map((c) => c[0])
+  const ys = cells.map((c) => c[1])
+  const minX = Math.min(...xs)
+  const minY = Math.min(...ys)
+  const spanX = Math.max(...xs) - minX + 1
+  const spanY = Math.max(...ys) - minY + 1
+  const size = Math.min(CELL * 0.72, (w - 10) / spanX, (h - 10) / spanY)
+  const ox = x + (w - spanX * size) / 2
+  const oy = y + (h - spanY * size) / 2
+  for (const [cx, cy] of cells) {
+    block(ctx, ox + (cx - minX) * size, oy + (cy - minY) * size, size, COLOR[type], alpha)
+  }
+}
+
+// --- effects -------------------------------------------------------------------
+
+/**
+ * Per-player effect state. `push(event)` is fed from game.events; `draw` fades
+ * each effect out over its lifetime.
+ */
+export class Effects {
+  constructor() {
+    this.items = []
+    this.shake = 0
+    this.rise = 0 // garbage just rose: board slides up from this many px
+  }
+
+  push(ev, now) {
+    switch (ev.type) {
+      case 'clear':
+        this.items.push({ kind: 'flash', rows: ev.rows, t0: now, life: 220 })
+        break
+      case 'hardDrop':
+        this.items.push({ kind: 'trail', cells: ev.cells, from: ev.fromY, t0: now, life: 160, color: COLOR[ev.piece] })
+        break
+      case 'callout':
+        this.items.push({ kind: 'text', lines: ev.lines, t0: now, life: 1400, tone: ev.tone })
+        break
+      case 'garbageIn':
+        this.shake = Math.min(10, 3 + ev.lines * 1.2)
+        this.rise = ev.lines * CELL
+        break
+      case 'attack':
+        this.items.push({ kind: 'sent', lines: ev.lines, t0: now, life: 900 })
+        break
+    }
+  }
+
+  step(dt) {
+    this.shake = Math.max(0, this.shake - dt * 0.03)
+    this.rise = Math.max(0, this.rise - dt * 0.9)
+  }
+}
+
+// --- field -------------------------------------------------------------------
+
+/**
+ * Draw one player's full panel: hold | meter | field | next.
+ * `game` is an engine Game; `fx` its Effects; `now` a ms clock.
+ */
+export function drawPlayer(ctx, game, fx, now, { dim = false } = {}) {
+  ctx.clearRect(0, 0, CANVAS_W, CANVAS_H)
+  ctx.save()
+  ctx.translate(0, HEAD) // everything below is laid out from the field's top edge
+
+  const fieldX = SIDE + GAP + METER + 4
+  const sx = (Math.random() - 0.5) * fx.shake
+  const sy = (Math.random() - 0.5) * fx.shake
+
+  // --- hold
+  ctx.fillStyle = '#8b97a8'
+  ctx.font = '600 11px ui-sans-serif, -apple-system, sans-serif'
+  ctx.fillText('HOLD', 4, 14)
+  panelBox(ctx, 0, 22, SIDE, SIDE * 0.72)
+  mini(ctx, game.hold, 0, 22, SIDE, SIDE * 0.72, game.canHold ? 1 : 0.35)
+
+  // --- next
+  const nx = fieldX + FIELD_W + GAP
+  ctx.fillStyle = '#8b97a8'
+  ctx.fillText('NEXT', nx + 4, 14)
+  const slot = SIDE * 0.62
+  panelBox(ctx, nx, 22, SIDE, slot * 5 + 8)
+  for (let i = 0; i < 5; i++) mini(ctx, game.queue[i], nx, 26 + i * slot, SIDE, slot)
+
+  // --- garbage meter: pending lines, red once they are ready to enter
+  const mx = SIDE + GAP
+  ctx.fillStyle = '#0a0d12'
+  ctx.fillRect(mx, 0, METER, FIELD_H)
+  let my = FIELD_H
+  for (const g of game.garbageQueue ?? []) {
+    const h = Math.min(my, g.lines * CELL)
+    const ready = game.time >= g.readyAt // garbage timing runs on game time
+    ctx.fillStyle = ready ? '#f0606d' : '#f2b84b'
+    ctx.fillRect(mx + 1, my - h + 1, METER - 2, h - 2)
+    my -= h
+    if (my <= 0) break
+  }
+
+  // --- the field itself
+  ctx.save()
+  ctx.translate(fieldX + sx, sy)
+  ctx.beginPath()
+  ctx.rect(0, -HEAD, FIELD_W, FIELD_H + HEAD) // the headroom is drawable too
+  ctx.clip()
+
+  ctx.fillStyle = '#080b10'
+  ctx.fillRect(0, 0, FIELD_W, FIELD_H)
+  ctx.strokeStyle = '#131a23'
+  ctx.lineWidth = 1
+  for (let x = 1; x < COLS; x++) line(ctx, x * CELL + 0.5, 0, x * CELL + 0.5, FIELD_H)
+  for (let y = 1; y < VIS; y++) line(ctx, 0, y * CELL + 0.5, FIELD_W, y * CELL + 0.5)
+
+  // garbage rising: the whole stack slides up into place
+  const rise = fx.rise
+  for (let y = 0; y < ROWS; y++) {
+    for (let x = 0; x < COLS; x++) {
+      const c = game.board[y][x]
+      if (!c) continue
+      const py = (y - BUFFER) * CELL + rise
+      if (py + CELL < -HEAD) continue
+      block(ctx, x * CELL, py, CELL, COLOR[c] ?? COLOR.G, dim ? 0.55 : 1)
+    }
+  }
+
+  const p = game.current
+  if (p && !game.gameOver) {
+    const color = COLOR[p.type]
+    const gy = game.ghostY()
+    for (const [cx, cy] of cellsAt(p.type, p.rot, p.x, gy)) {
+      if (cy >= BUFFER) ghost(ctx, cx * CELL, (cy - BUFFER) * CELL, CELL, color)
+    }
+    // Smooth fall: draw the piece part-way to the next row, but only when it
+    // really can fall, so it never visually sinks into the stack.
+    const frac = game.fallFraction()
+    // Fade toward white as lock delay runs out, like modern clients do.
+    const lockFade = game.lockProgress()
+    for (const [cx, cy] of cellsAt(p.type, p.rot, p.x, p.y)) {
+      const py = (cy - BUFFER + frac) * CELL
+      if (py + CELL <= -HEAD) continue
+      block(ctx, cx * CELL, py, CELL, color)
+      if (lockFade > 0) {
+        ctx.globalAlpha = lockFade * 0.35
+        ctx.fillStyle = '#fff'
+        ctx.fillRect(cx * CELL + 1, py + 1, CELL - 2, CELL - 2)
+        ctx.globalAlpha = 1
+      }
+    }
+  }
+
+  // effects inside the field
+  for (const it of fx.items) {
+    const k = 1 - (now - it.t0) / it.life
+    if (k <= 0) continue
+    if (it.kind === 'flash') {
+      ctx.globalAlpha = k * 0.85
+      ctx.fillStyle = '#ffffff'
+      for (const r of it.rows) ctx.fillRect(0, (r - BUFFER) * CELL, FIELD_W, CELL)
+      ctx.globalAlpha = 1
+    } else if (it.kind === 'trail') {
+      // a short streak from where the piece was dropped down to where it landed
+      ctx.globalAlpha = k * 0.35
+      ctx.fillStyle = it.color
+      const top = (it.from - BUFFER) * CELL
+      for (const cx of new Set(it.cells.map(([x]) => x))) {
+        const low = Math.min(...it.cells.filter(([x]) => x === cx).map(([, y]) => y))
+        const h = (low - BUFFER) * CELL - top
+        if (h > 0) ctx.fillRect(cx * CELL + 3, top, CELL - 6, h)
+      }
+      ctx.globalAlpha = 1
+    }
+  }
+
+  // game-over veil
+  if (game.gameOver) {
+    ctx.fillStyle = 'rgba(8, 11, 16, 0.55)'
+    ctx.fillRect(0, 0, FIELD_W, FIELD_H)
+  }
+
+  ctx.restore()
+
+  // field border (outside the clip so it never shakes off-screen)
+  ctx.strokeStyle = '#2a3542'
+  ctx.lineWidth = 1
+  ctx.strokeRect(fieldX + 0.5, 0.5, FIELD_W, FIELD_H)
+
+  // callouts: spin names, B2B, combo, all clear, at the foot of the hold column
+  let ty = FIELD_H - CALLOUT_H + 14 // translated coords: FIELD_H is the floor
+  const recent = fx.items.filter((it) => it.kind === 'text' && now - it.t0 < it.life).slice(-3)
+  for (const it of recent) {
+    const k = 1 - (now - it.t0) / it.life
+    const a = Math.min(1, k * 3)
+    const slide = (1 - Math.min(1, (now - it.t0) / 120)) * 12
+    ctx.globalAlpha = a
+    ctx.textAlign = 'right'
+    it.lines.forEach((text, i) => {
+      ctx.fillStyle = i === 0 ? toneColor(it.tone) : '#e6edf5'
+      ctx.font = i === 0 ? '800 15px ui-sans-serif, -apple-system, sans-serif' : '700 12px ui-sans-serif, -apple-system, sans-serif'
+      ctx.fillText(text, SIDE - 2 + slide, ty + i * 17)
+    })
+    ctx.textAlign = 'left'
+    ctx.globalAlpha = 1
+    ty += it.lines.length * 17 + 14
+  }
+
+  // lines sent: a brief "+N" over the meter
+  for (const it of fx.items) {
+    if (it.kind !== 'sent') continue
+    const t = (now - it.t0) / it.life
+    if (t >= 1) continue
+    ctx.globalAlpha = 1 - t
+    ctx.fillStyle = '#f2b84b'
+    ctx.font = '800 20px ui-sans-serif, -apple-system, sans-serif'
+    ctx.textAlign = 'center'
+    ctx.fillText(`+${it.lines}`, fieldX + FIELD_W / 2, FIELD_H * 0.35 - t * 40)
+    ctx.textAlign = 'left'
+    ctx.globalAlpha = 1
+  }
+
+  ctx.restore()
+  fx.items = fx.items.filter((it) => now - it.t0 < it.life)
+}
+
+function toneColor(tone) {
+  return { spin: '#b26cf0', quad: '#3fd0e6', clear: '#f2d24b', combo: '#63d65f' }[tone] ?? '#e6edf5'
+}
+
+function panelBox(ctx, x, y, w, h) {
+  ctx.fillStyle = '#0d1219'
+  ctx.fillRect(x, y, w, h)
+  ctx.strokeStyle = '#1f2833'
+  ctx.lineWidth = 1
+  ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1)
+}
+
+function line(ctx, x1, y1, x2, y2) {
+  ctx.beginPath()
+  ctx.moveTo(x1, y1)
+  ctx.lineTo(x2, y2)
+  ctx.stroke()
+}
+
+/**
+ * Render Snake game on the arena canvas matching Tetris cyberpunk dark style.
+ */
+export function drawSnakePlayer(ctx, snakeGame, isLeft) {
+  ctx.clearRect(0, 0, CANVAS_W, CANVAS_H)
+  if (!snakeGame) return
+
+  const boardSize = 20
+  const cellSize = 24
+  const bw = boardSize * cellSize
+  const bh = boardSize * cellSize
+  const ox = Math.floor((CANVAS_W - bw) / 2)
+  const oy = Math.floor((CANVAS_H - bh) / 2) + 10
+
+  // Outer panel
+  ctx.save()
+  ctx.fillStyle = '#0a0e17'
+  ctx.fillRect(0, 0, CANVAS_W, CANVAS_H)
+
+  // Arena container border
+  ctx.fillStyle = '#0d131f'
+  ctx.strokeStyle = isLeft ? '#0284c7' : '#9333ea'
+  ctx.lineWidth = 2
+  ctx.strokeRect(ox - 3.5, oy - 3.5, bw + 7, bh + 7)
+  ctx.fillRect(ox - 2, oy - 2, bw + 4, bh + 4)
+
+  // Checkerboard
+  for (let r = 0; r < boardSize; r++) {
+    for (let c = 0; c < boardSize; c++) {
+      ctx.fillStyle = (r + c) % 2 === 0 ? '#0b101b' : '#0e1524'
+      ctx.fillRect(ox + c * cellSize, oy + r * cellSize, cellSize, cellSize)
+    }
+  }
+
+  // Food
+  if (snakeGame.food) {
+    const fx = ox + snakeGame.food.x * cellSize + cellSize / 2
+    const fy = oy + snakeGame.food.y * cellSize + cellSize / 2
+    const rad = cellSize * 0.4
+    ctx.save()
+    ctx.fillStyle = '#ef4444'
+    ctx.shadowColor = '#f87171'
+    ctx.shadowBlur = 12
+    ctx.beginPath()
+    ctx.arc(fx, fy, rad, 0, Math.PI * 2)
+    ctx.fill()
+
+    ctx.fillStyle = '#22c55e'
+    ctx.beginPath()
+    ctx.arc(fx + 2, fy - rad + 2, rad * 0.4, 0, Math.PI * 2)
+    ctx.fill()
+    ctx.restore()
+  }
+
+  // Snake body
+  const snake = snakeGame.snake
+  for (let i = snake.length - 1; i >= 0; i--) {
+    const s = snake[i]
+    const sx = ox + s.x * cellSize
+    const sy = oy + s.y * cellSize
+
+    if (i === 0) {
+      // Head
+      ctx.save()
+      ctx.fillStyle = isLeft ? '#38bdf8' : '#c084fc'
+      ctx.shadowColor = isLeft ? '#0284c7' : '#a855f7'
+      ctx.shadowBlur = 14
+      ctx.beginPath()
+      ctx.roundRect(sx + 1, sy + 1, cellSize - 2, cellSize - 2, 6)
+      ctx.fill()
+
+      // Eyes
+      const hx = sx + cellSize / 2
+      const hy = sy + cellSize / 2
+      const dir = snakeGame.dir
+      const eyeOffset = cellSize * 0.25
+      const eyeSize = cellSize * 0.15
+
+      let e1x = hx - eyeOffset, e1y = hy - eyeOffset
+      let e2x = hx + eyeOffset, e2y = hy - eyeOffset
+      if (dir.name === 'LEFT') {
+        e1x = hx - eyeOffset; e1y = hy - eyeOffset
+        e2x = hx - eyeOffset; e2y = hy + eyeOffset
+      } else if (dir.name === 'RIGHT') {
+        e1x = hx + eyeOffset; e1y = hy - eyeOffset
+        e2x = hx + eyeOffset; e2y = hy + eyeOffset
+      } else if (dir.name === 'DOWN') {
+        e1x = hx - eyeOffset; e1y = hy + eyeOffset
+        e2x = hx + eyeOffset; e2y = hy + eyeOffset
+      }
+
+      ctx.fillStyle = '#fff'
+      ctx.beginPath(); ctx.arc(e1x, e1y, eyeSize, 0, Math.PI * 2); ctx.fill()
+      ctx.beginPath(); ctx.arc(e2x, e2y, eyeSize, 0, Math.PI * 2); ctx.fill()
+      ctx.fillStyle = '#000'
+      ctx.beginPath(); ctx.arc(e1x + dir.x, e1y + dir.y, eyeSize * 0.5, 0, Math.PI * 2); ctx.fill()
+      ctx.beginPath(); ctx.arc(e2x + dir.x, e2y + dir.y, eyeSize * 0.5, 0, Math.PI * 2); ctx.fill()
+      ctx.restore()
+    } else {
+      // Body
+      const t = i / snake.length
+      ctx.fillStyle = isLeft
+        ? (t < 0.5 ? '#0ea5e9' : '#10b981')
+        : (t < 0.5 ? '#a855f7' : '#6366f1')
+      ctx.beginPath()
+      ctx.roundRect(sx + 2, sy + 2, cellSize - 4, cellSize - 4, 4)
+      ctx.fill()
+    }
+  }
+
+  // Header info
+  ctx.font = 'bold 15px ui-sans-serif, -apple-system, sans-serif'
+  ctx.fillStyle = isLeft ? '#38bdf8' : '#c084fc'
+  ctx.fillText(`得分: ${snakeGame.score} (苹果: ${snakeGame.applesEaten})`, ox, oy - 14)
+  ctx.textAlign = 'right'
+  ctx.fillStyle = '#94a3b8'
+  ctx.fillText(`存活步数: ${snakeGame.steps} | 长度: ${snake.length}`, ox + bw, oy - 14)
+  ctx.textAlign = 'left'
+
+  // Game over overlay
+  if (!snakeGame.alive) {
+    ctx.fillStyle = 'rgba(15, 23, 42, 0.75)'
+    ctx.fillRect(ox, oy, bw, bh)
+    ctx.font = 'bold 24px ui-sans-serif, -apple-system, sans-serif'
+    ctx.fillStyle = '#ef4444'
+    ctx.textAlign = 'center'
+    ctx.fillText('撞墙/自咬淘汰 (TOP OUT)', ox + bw / 2, oy + bh / 2 - 10)
+    ctx.font = '14px ui-sans-serif, -apple-system, sans-serif'
+    ctx.fillStyle = '#cbd5e1'
+    ctx.fillText(`存活步数: ${snakeGame.steps} · 最终长度: ${snake.length}`, ox + bw / 2, oy + bh / 2 + 18)
+    ctx.textAlign = 'left'
+  }
+
+  ctx.restore()
+}
+
+/**
+ * Render Sokoban game on the arena canvas matching Tetris cyberpunk dark style.
+ */
+export function drawSokobanPlayer(ctx, sokoGame, isLeft) {
+  ctx.clearRect(0, 0, CANVAS_W, CANVAS_H)
+  if (!sokoGame) return
+
+  const cellSize = Math.min(36, Math.floor(480 / Math.max(sokoGame.cols, sokoGame.rows)))
+  const bw = sokoGame.cols * cellSize
+  const bh = sokoGame.rows * cellSize
+  const ox = Math.floor((CANVAS_W - bw) / 2)
+  const oy = Math.floor((CANVAS_H - bh) / 2) + 10
+
+  ctx.save()
+  ctx.fillStyle = '#0a0e17'
+  ctx.fillRect(0, 0, CANVAS_W, CANVAS_H)
+
+  // Arena container border
+  ctx.fillStyle = '#0d131f'
+  ctx.strokeStyle = isLeft ? '#0284c7' : '#9333ea'
+  ctx.lineWidth = 2
+  ctx.strokeRect(ox - 3.5, oy - 3.5, bw + 7, bh + 7)
+  ctx.fillRect(ox - 2, oy - 2, bw + 4, bh + 4)
+
+  // Floor
+  ctx.fillStyle = '#0b101b'
+  ctx.fillRect(ox, oy, bw, bh)
+
+  // Walls
+  for (const w of sokoGame.walls) {
+    const wx = ox + w.x * cellSize
+    const wy = oy + w.y * cellSize
+    ctx.fillStyle = '#1e293b'
+    ctx.fillRect(wx, wy, cellSize, cellSize)
+    ctx.strokeStyle = '#334155'
+    ctx.lineWidth = 1
+    ctx.strokeRect(wx + 1, wy + 1, cellSize - 2, cellSize - 2)
+    ctx.fillStyle = '#0f172a'
+    ctx.fillRect(wx + 3, wy + 3, cellSize - 6, cellSize - 6)
+  }
+
+  // Targets
+  for (const t of sokoGame.targets) {
+    const tx = ox + t.x * cellSize + cellSize / 2
+    const ty = oy + t.y * cellSize + cellSize / 2
+    ctx.fillStyle = '#f59e0b'
+    ctx.shadowColor = '#fbbf24'
+    ctx.shadowBlur = 8
+    ctx.beginPath(); ctx.arc(tx, ty, cellSize * 0.22, 0, Math.PI * 2); ctx.fill()
+    ctx.strokeStyle = '#d97706'
+    ctx.lineWidth = 1.5
+    ctx.beginPath(); ctx.arc(tx, ty, cellSize * 0.38, 0, Math.PI * 2); ctx.stroke()
+  }
+
+  // Boxes
+  for (const b of sokoGame.boxes) {
+    const bx = ox + b.x * cellSize
+    const by = oy + b.y * cellSize
+    const onTarget = sokoGame.targets.some((t) => t.x === b.x && t.y === b.y)
+
+    ctx.save()
+    if (onTarget) {
+      ctx.fillStyle = '#059669'
+      ctx.shadowColor = '#10b981'
+      ctx.shadowBlur = 12
+      ctx.strokeStyle = '#34d399'
+    } else {
+      ctx.fillStyle = '#b45309'
+      ctx.shadowColor = '#d97706'
+      ctx.shadowBlur = 6
+      ctx.strokeStyle = '#f59e0b'
+    }
+    ctx.lineWidth = 2
+    ctx.beginPath()
+    ctx.roundRect(bx + 2, by + 2, cellSize - 4, cellSize - 4, 5)
+    ctx.fill()
+    ctx.stroke()
+
+    // Diagonal brace
+    ctx.strokeStyle = onTarget ? '#10b981' : '#78350f'
+    ctx.lineWidth = 1.5
+    ctx.beginPath()
+    ctx.moveTo(bx + 5, by + 5); ctx.lineTo(bx + cellSize - 5, by + cellSize - 5)
+    ctx.moveTo(bx + cellSize - 5, by + 5); ctx.lineTo(bx + 5, by + cellSize - 5)
+    ctx.stroke()
+    ctx.restore()
+  }
+
+  // Player
+  const p = sokoGame.player
+  const px = ox + p.x * cellSize + cellSize / 2
+  const py = oy + p.y * cellSize + cellSize / 2
+  ctx.save()
+  ctx.fillStyle = isLeft ? '#38bdf8' : '#c084fc'
+  ctx.shadowColor = isLeft ? '#0284c7' : '#a855f7'
+  ctx.shadowBlur = 10
+  ctx.beginPath()
+  ctx.arc(px, py, cellSize * 0.38, 0, Math.PI * 2)
+  ctx.fill()
+  ctx.restore()
+
+  // Header stats
+  ctx.font = 'bold 15px ui-sans-serif, -apple-system, sans-serif'
+  ctx.fillStyle = isLeft ? '#38bdf8' : '#c084fc'
+  const solved = sokoGame.boxes.filter((b) => sokoGame.targets.some((t) => t.x === b.x && t.y === b.y)).length
+  ctx.fillText(`目标达成: ${solved} / ${sokoGame.boxes.length}`, ox, oy - 14)
+  ctx.textAlign = 'right'
+  ctx.fillStyle = '#94a3b8'
+  ctx.fillText(`步数: ${sokoGame.steps} · 推箱: ${sokoGame.pushes}`, ox + bw, oy - 14)
+  ctx.textAlign = 'left'
+
+  // Level clear overlay
+  if (sokoGame.completed) {
+    ctx.fillStyle = 'rgba(15, 23, 42, 0.75)'
+    ctx.fillRect(ox, oy, bw, bh)
+    ctx.font = 'bold 26px ui-sans-serif, -apple-system, sans-serif'
+    ctx.fillStyle = '#10b981'
+    ctx.textAlign = 'center'
+    ctx.fillText('🎉 全部箱子就位 (SOLVED)!', ox + bw / 2, oy + bh / 2 - 10)
+    ctx.font = '14px ui-sans-serif, -apple-system, sans-serif'
+    ctx.fillStyle = '#cbd5e1'
+    ctx.fillText(`解谜完成！总步数: ${sokoGame.steps} | 总推移: ${sokoGame.pushes}`, ox + bw / 2, oy + bh / 2 + 18)
+    ctx.textAlign = 'left'
+  }
+
+  ctx.restore()
+}
+
