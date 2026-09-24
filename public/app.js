@@ -103,7 +103,7 @@ const mode = () => MODES[$('mode')?.value] ?? MODES['tri']
 // Unified single speed setting for all AI agents
 function getSpeed() {
   const el = $('battle-speed')
-  const v = el ? el.value : '1.8'
+  const v = el ? el.value : '3.5'
   return v === 'max' ? { pps: 0, superhuman: true } : { pps: Number(v), superhuman: false }
 }
 
