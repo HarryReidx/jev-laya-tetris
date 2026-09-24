@@ -13,6 +13,7 @@ import { COLS, ROWS } from './engine/pieces.js'
 import { JevClient, loadEnv } from './ai/jev.js'
 import { LayaClient, buildLayaDecision, combineWithPrior } from './ai/laya.js'
 import { CommentaryEngine } from './ai/commentary.js'
+import { LlmClient } from './ai/llm.js'
 import {
   candidatesFor, buildBattleState, buildBattleQuestions, readBattleDecision,
 } from './ai/battle.js'
@@ -28,6 +29,11 @@ const BODY_MAX = 64 * 1024
 const DECIDER = process.env.DECIDER === 'laya' ? 'laya' : 'jev'
 const clients = { laya: new LayaClient() }
 const commentary = new CommentaryEngine()
+clients.llm = new LlmClient({
+  endpoint: commentary.endpoint,
+  apiKey: commentary.apiKey,
+  model: commentary.model,
+})
 let jevError = null
 try {
   clients.jev = new JevClient()
@@ -117,6 +123,7 @@ async function decide(pos, model) {
     if (model === 'laya') response = combineWithPrior(response, candidates)
     d = readBattleDecision(response, candidates)
     d.modelChoice = response.answers?.placement?.layaChoice ?? null
+    d.reasoning = response.answers?.placement?.reasoning ?? null
   } catch (err) {
     error = err.message
   }
@@ -132,7 +139,8 @@ async function decide(pos, model) {
   console.log(
     `  [TETRIS #${String(decided).padStart(4)}] ${model.padEnd(4)} ${chosen.type} ${chosen.id.padEnd(12)}` +
       ` sends ${chosen.sent} conf ${(d?.confidence ?? 0).toFixed(2)} ${String(d?.latencyMs ?? '--').padStart(4)}ms` +
-      `${fallback ? `  FALLBACK (${error})` : ''}`
+      `${fallback ? `  FALLBACK (${error})` : ''}` +
+      `${d?.reasoning ? ` [${d.reasoning.slice(0, 40)}]` : ''}`
   )
 
   return {
@@ -140,6 +148,7 @@ async function decide(pos, model) {
     confidence: d?.confidence ?? null,
     probabilities: probs,
     latencyMs: d?.latencyMs ?? null,
+    reasoning: d?.reasoning ?? null,
     options: candidates.length,
     total,
     fallback,
@@ -170,10 +179,17 @@ async function health() {
   const jev = clients.jev
     ? { ok: true, model: clients.jev.model, ...clients.jev.stats() }
     : { ok: false, error: jevError }
+  const llm = {
+    ok: Boolean(commentary.apiKey),
+    model: commentary.model,
+    endpoint: commentary.endpoint,
+    n: clients.llm?.latencies?.length ?? 0,
+    p50: clients.llm?.latencies?.length ? Math.round(clients.llm.latencies.slice().sort((a,b)=>a-b)[Math.floor(clients.llm.latencies.length/2)]) : 0,
+  }
   return {
     ok: true,
     model: DECIDER,
-    models: { jev, laya },
+    models: { llm, jev, laya },
     commentary: {
       ok: Boolean(commentary.apiKey),
       model: commentary.model,
@@ -294,14 +310,17 @@ const server = http.createServer((req, res) => {
         if (cfg.llm) {
           if (cfg.llm.endpoint) {
             commentary.endpoint = cfg.llm.endpoint
+            clients.llm.endpoint = cfg.llm.endpoint
             envUpdates.GEMINI_PROXY_URL = cfg.llm.endpoint
           }
           if (cfg.llm.model) {
             commentary.model = cfg.llm.model
+            clients.llm.model = cfg.llm.model
             envUpdates.GEMINI_MODEL = cfg.llm.model
           }
           if (cfg.llm.apiKey && !cfg.llm.apiKey.includes('...')) {
             commentary.apiKey = cfg.llm.apiKey
+            clients.llm.apiKey = cfg.llm.apiKey
             envUpdates.GEMINI_API_KEY = cfg.llm.apiKey
           }
         }

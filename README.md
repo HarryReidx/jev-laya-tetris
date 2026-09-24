@@ -59,11 +59,12 @@
 
 ---
 
-## 🌟 Key Highlights
+## 🌟 Key Highlights & 3-Way Architectural Comparison
 
-1. **Dual AI Duel Architecture**:
-   - **TypeSafe Jev (Cloud System 1)**: Excels at long-term board structure foresight, calculating Back-to-Back chains, downstacking survivability, and T-Spin Double opportunities.
-   - **Convai Laya (Local GPU ModernBERT)**: Hosted on server `172.24.0.5` accelerated by NVIDIA TITAN RTX. Evaluates candidate placements with ultra-low **35-45ms latency**, unleashing high-frequency drops and impenetrable defensive pacing.
+1. **Tri-Architecture AI Showdown (LLM vs LLM+Jev vs LLM+Laya)**:
+   - **Far Left · Pure LLM (End-to-End Prompt)**: Evaluates the board and selects placements directly via foundation LLM (Gemini / GPT). Bound by autoregressive token generation latency (**~800-1500ms**) and network delays, showcasing the real-world limits of pure System 2 under intense physical gravity pressure.
+   - **Center · LLM + Jev (Cloud Hybrid Architecture)**: TypeSafe Jev Cloud System 1 discrete classification paired with LLM tactical guidance. Calculated board foresight, B2B chains, and T-Spins with steady **~180-250ms** pacing.
+   - **Far Right · LLM + Laya (Local GPU ModernBERT Architecture)**: On-premise NVIDIA TITAN RTX GPU accelerating ModernBERT tensor inference. Blistering **35-45ms latency**, unleashing extreme APM/PPS, rapid drops, and impenetrable defense.
 2. **Standardized TETR.IO Tournament Rules**:
    - True 7-Bag pseudo-random generation.
    - SRS (Super Rotation System) with full 5-point wall-kick tables.
@@ -71,7 +72,7 @@
    - Dynamic garbage meter, cancel mechanics, combo tables, and T-spin recognition.
 3. **Bilingual Localization (中英文无缝切换)**:
    - One-click instant language toggle (`🌐 EN / 中文`) in the top navigation bar.
-   - Full translation coverage across HUD stats, AI commentary, game summaries, dialogs, and configuration panels.
+   - Full translation coverage across 3 boards, HUD stats, AI commentary, game summaries, dialogs, and configuration panels.
 4. **React-Bits Modern UI/UX**:
    - **`SpotlightCard`**: Interactive cursor-following lighting effects with frosted glass surface.
    - **`CallChip` Status Dock**: Live glowing heartbeat dots showing engine statuses and latency.
